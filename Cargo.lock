@@ -993,7 +993,7 @@ dependencies = [
 [[package]]
 name = "halo2_proofs"
 version = "0.3.2"
-source = "git+https://github.com/TalDerei/halo2?branch=fingerprint-verifier#79004260cf8ed5b2f6a0ee640dd0d18d31ececf1"
+source = "git+https://github.com/TalDerei/halo2?branch=fingerprint-verifier#61b8ab6f26ba007c4bc75f6e5ec7b4bd2ccd4290"
 dependencies = [
  "blake2b_simd",
  "ff",
