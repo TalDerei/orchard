@@ -1322,11 +1322,10 @@ mod tests {
             verify_proof(&vk.params, &vk.vk, strategy, &raw_instances, &mut transcript).unwrap();
 
         let (g_scalars, w_scalar, u_scalar, other) = msm.fingerprint_terms();
-        let challenges = transcript.challenges;
         assert!(g_scalars.is_some());
         assert!(w_scalar.is_some() && u_scalar.is_some());
         assert!(!other.is_empty());
-        assert!(!challenges.is_empty());
+        assert!(!transcript.challenges.is_empty());
         std::eprintln!(
             "Orchard fingerprint: {} g-scalars (n = 2^{}), w={}, u={}, {} commitment terms, {} challenges",
             g_scalars.as_ref().unwrap().len(),
@@ -1334,12 +1333,33 @@ mod tests {
             w_scalar.is_some(),
             u_scalar.is_some(),
             other.len(),
-            challenges.len(),
+            transcript.challenges.len(),
         );
         assert!(
             msm.eval(),
             "captured Orchard fingerprint must be the identity for a valid proof"
         );
+
+        // Emit the Lean fixture (proof string + challenges + VK + assembled MSM + the
+        // `MsmMatch (assemble vk ps ch) capturedMsm := by native_decide` theorem) so the
+        // independent Lean model can re-derive the fingerprint and check it matches.
+        let fixture = vk.vk.dump_lean_fixture(
+            K,
+            1,
+            &transcript.common_points,
+            &transcript.points,
+            &transcript.scalars,
+            &transcript.challenges,
+            g_scalars.as_ref().unwrap(),
+            w_scalar.unwrap(),
+            u_scalar.unwrap(),
+            &other,
+        );
+        std::fs::write(
+            "/Users/mariusmargulus/Desktop/programming/Repository/Projects/zcash/ironwood/Zcash/Snark/Fixture.lean",
+            fixture,
+        )
+        .unwrap();
     }
 
     // Proves with the proving key for `proving_version` and checks that the proof verifies
