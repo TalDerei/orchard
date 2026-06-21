@@ -1292,6 +1292,56 @@ mod tests {
         assert_eq!(proof.0.len(), expected_proof_size);
     }
 
+    #[test]
+    fn fingerprint_capture() {
+        use halo2_proofs::plonk::{verify_proof, FingerprintStrategy};
+        use halo2_proofs::transcript::{Challenge255, ChallengeRecorder};
+
+        let mut rng = OsRng;
+        let (circuit, instance) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+
+        let pk = ProvingKey::build();
+        let vk = VerifyingKey::build();
+
+        let circuits = [circuit];
+        let instances = [instance];
+        let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
+        // Sanity: it verifies normally.
+        assert!(proof.verify(&vk, &instances).is_ok());
+
+        // Capture the Orchard verifier fingerprint (the assembled MSM) and the Fiat-Shamir
+        // challenges — the reference an independent (Lean) model assembles and matches against.
+        let raw_instance = instances[0].to_halo2_instance();
+        let raw_instance: Vec<_> = raw_instance.iter().map(|col| &col[..]).collect();
+        let raw_instances = [&raw_instance[..]];
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof.0[..]);
+        let msm =
+            verify_proof(&vk.params, &vk.vk, strategy, &raw_instances, &mut transcript).unwrap();
+
+        let (g_scalars, w_scalar, u_scalar, other) = msm.fingerprint_terms();
+        let challenges = transcript.challenges;
+        assert!(g_scalars.is_some());
+        assert!(w_scalar.is_some() && u_scalar.is_some());
+        assert!(!other.is_empty());
+        assert!(!challenges.is_empty());
+        std::eprintln!(
+            "Orchard fingerprint: {} g-scalars (n = 2^{}), w={}, u={}, {} commitment terms, {} challenges",
+            g_scalars.as_ref().unwrap().len(),
+            K,
+            w_scalar.is_some(),
+            u_scalar.is_some(),
+            other.len(),
+            challenges.len(),
+        );
+        assert!(
+            msm.eval(),
+            "captured Orchard fingerprint must be the identity for a valid proof"
+        );
+    }
+
     // Proves with the proving key for `proving_version` and checks that the proof verifies
     // under the verifying key for the same version, but not under the verifying key for
     // `other_version`. The two circuit versions have different verifying keys, so a proof is

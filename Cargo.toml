@@ -110,3 +110,9 @@ debug = true
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+# Use the fingerprint-verifier fork of halo2 (adds FingerprintStrategy / ChallengeRecorder /
+# MSM::fingerprint_terms) so the Orchard verifier fingerprint can be captured. Capture-only; the
+# additions are additive and API-compatible with published halo2_proofs 0.3.
+halo2_proofs = { git = "https://github.com/TalDerei/halo2", branch = "fingerprint-verifier" }
