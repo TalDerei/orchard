@@ -1362,6 +1362,79 @@ mod tests {
         .unwrap();
     }
 
+    /// As `fingerprint_capture`, but for a two-action bundle (`num_proofs = 2`), so the captured
+    /// fixture exercises the verifier's per-sub-proof iteration (the multi-action read schedule,
+    /// per-proof expression folds, and per-proof query wiring) that a single-action capture never
+    /// reaches. See https://github.com/zcash/ironwood/issues/17.
+    #[test]
+    fn fingerprint_capture_two_actions() {
+        use halo2_proofs::plonk::{verify_proof, FingerprintStrategy};
+        use halo2_proofs::transcript::{Challenge255, ChallengeRecorder};
+
+        let mut rng = OsRng;
+        let (circuit1, instance1) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+        let (circuit2, instance2) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+
+        let pk = ProvingKey::build();
+        let vk = VerifyingKey::build();
+
+        let circuits = [circuit1, circuit2];
+        let instances = [instance1, instance2];
+        let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
+        // Sanity: it verifies normally.
+        assert!(proof.verify(&vk, &instances).is_ok());
+
+        // Capture the two-action fingerprint and challenges, as in `fingerprint_capture`.
+        let raw_instance1 = instances[0].to_halo2_instance();
+        let raw_instance1: Vec<_> = raw_instance1.iter().map(|col| &col[..]).collect();
+        let raw_instance2 = instances[1].to_halo2_instance();
+        let raw_instance2: Vec<_> = raw_instance2.iter().map(|col| &col[..]).collect();
+        let raw_instances = [&raw_instance1[..], &raw_instance2[..]];
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof.0[..]);
+        let msm =
+            verify_proof(&vk.params, &vk.vk, strategy, &raw_instances, &mut transcript).unwrap();
+
+        let (g_scalars, w_scalar, u_scalar, other) = msm.fingerprint_terms();
+        assert!(g_scalars.is_some());
+        assert!(w_scalar.is_some() && u_scalar.is_some());
+        assert!(!other.is_empty());
+        assert!(!transcript.challenges.is_empty());
+        std::eprintln!(
+            "Orchard two-action fingerprint: {} g-scalars (n = 2^{}), {} commitment terms, {} challenges",
+            g_scalars.as_ref().unwrap().len(),
+            K,
+            other.len(),
+            transcript.challenges.len(),
+        );
+        assert!(
+            msm.eval(),
+            "captured two-action Orchard fingerprint must be the identity for a valid proof"
+        );
+
+        let fixture = vk.vk.dump_lean_fixture(
+            K,
+            2,
+            &transcript.common_points,
+            &transcript.points,
+            &transcript.scalars,
+            &transcript.challenges,
+            g_scalars.as_ref().unwrap(),
+            w_scalar.unwrap(),
+            u_scalar.unwrap(),
+            &other,
+        );
+        std::fs::write(
+            std::env::var("ORCHARD_LEAN_FIXTURE_OUT")
+                .unwrap_or_else(|_| "fixture-two-actions.lean".into()),
+            fixture,
+        )
+        .unwrap();
+    }
+
     // Proves with the proving key for `proving_version` and checks that the proof verifies
     // under the verifying key for the same version, but not under the verifying key for
     // `other_version`. The two circuit versions have different verifying keys, so a proof is
