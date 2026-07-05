@@ -1344,6 +1344,7 @@ mod tests {
         // `MsmMatch (assemble vk ps ch) capturedMsm := by native_decide` theorem) so the
         // independent Lean model can re-derive the fingerprint and check it matches.
         let fixture = vk.vk.dump_lean_fixture(
+            "Zcash.Snark.Fixture",
             K,
             1,
             &transcript.common_points,
@@ -1417,6 +1418,7 @@ mod tests {
         );
 
         let fixture = vk.vk.dump_lean_fixture(
+            "Zcash.Snark.Fixture2",
             K,
             2,
             &transcript.common_points,
