@@ -1241,9 +1241,15 @@ mod tests {
             .collect()
     }
 
+    enum ScalarEventEdit {
+        Write(vesta::Scalar),
+        Skip,
+        Stop,
+    }
+
     fn proof_from_read_events(
         events: &[halo2_proofs::transcript::TranscriptEvent<vesta::Affine>],
-        mut scalar_mutation: impl FnMut(usize, vesta::Scalar) -> Option<vesta::Scalar>,
+        mut scalar_mutation: impl FnMut(usize, vesta::Scalar) -> ScalarEventEdit,
     ) -> Vec<u8> {
         use halo2_proofs::transcript::{Blake2bWrite, Challenge255, TranscriptWrite};
 
@@ -1256,8 +1262,9 @@ mod tests {
                 }
                 halo2_proofs::transcript::TranscriptEvent::ReadScalar(scalar) => {
                     match scalar_mutation(scalar_idx, *scalar) {
-                        Some(scalar) => transcript.write_scalar(scalar).unwrap(),
-                        None => break,
+                        ScalarEventEdit::Write(scalar) => transcript.write_scalar(scalar).unwrap(),
+                        ScalarEventEdit::Skip => {}
+                        ScalarEventEdit::Stop => break,
                     }
                     scalar_idx += 1;
                 }
@@ -1541,7 +1548,9 @@ mod tests {
         .unwrap();
         assert!(valid_msm.eval());
         assert_eq!(
-            proof_from_read_events(&transcript.events, |_, scalar| Some(scalar)),
+            proof_from_read_events(&transcript.events, |_, scalar| ScalarEventEdit::Write(
+                scalar
+            )),
             proof.0,
             "captured read events should reserialize the original proof exactly"
         );
@@ -1549,7 +1558,7 @@ mod tests {
         let n_instance_evals = instances.len();
         let first_advice_eval = n_instance_evals;
         let tampered_proof = proof_from_read_events(&transcript.events, |idx, scalar| {
-            Some(if idx == first_advice_eval {
+            ScalarEventEdit::Write(if idx == first_advice_eval {
                 scalar + vesta::Scalar::ONE
             } else {
                 scalar
@@ -1608,9 +1617,9 @@ mod tests {
 
         let truncated_u_proof = proof_from_read_events(&transcript.events, |idx, scalar| {
             if idx + 1 == first_multiopen_u + n_multiopen_u {
-                None
+                ScalarEventEdit::Stop
             } else {
-                Some(scalar)
+                ScalarEventEdit::Write(scalar)
             }
         });
         let strategy = SingleVerifier::new(&vk.params);
@@ -1631,8 +1640,36 @@ mod tests {
             "malformed-u capture should reach the multiopen x3 challenge before rejection"
         );
 
+        let first_permutation_set_eval = n_instance_evals
+            + instances.len() * n_advice_queries
+            + n_fixed_evals
+            + 1
+            + n_permutation_common_evals;
+        let first_nonlast_permutation_last_eval = first_permutation_set_eval + 2;
+        let missing_permutation_last_eval_proof =
+            proof_from_read_events(&transcript.events, |idx, scalar| {
+                if idx == first_nonlast_permutation_last_eval {
+                    ScalarEventEdit::Skip
+                } else {
+                    ScalarEventEdit::Write(scalar)
+                }
+            });
+        let strategy = SingleVerifier::new(&vk.params);
+        let mut missing_permutation_last_eval_transcript =
+            ChallengeRecorder::<_, _, Challenge255<_>>::init(
+                &missing_permutation_last_eval_proof[..],
+            );
+        assert!(verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instance_refs,
+            &mut missing_permutation_last_eval_transcript,
+        )
+        .is_err());
+
         std::eprintln!(
-            "Orchard negative captures: tampered advice eval events={} challenges={} scalars={} points={}; truncated-u events={} challenges={} scalars={} points={}",
+            "Orchard negative captures: tampered advice eval events={} challenges={} scalars={} points={}; truncated-u events={} challenges={} scalars={} points={}; missing permutation last-eval events={} challenges={} scalars={} points={}",
             tampered_reject_transcript.events.len(),
             tampered_reject_transcript.challenges.len(),
             tampered_reject_transcript.scalars.len(),
@@ -1641,6 +1678,10 @@ mod tests {
             truncated_u_transcript.challenges.len(),
             truncated_u_transcript.scalars.len(),
             truncated_u_transcript.points.len(),
+            missing_permutation_last_eval_transcript.events.len(),
+            missing_permutation_last_eval_transcript.challenges.len(),
+            missing_permutation_last_eval_transcript.scalars.len(),
+            missing_permutation_last_eval_transcript.points.len(),
         );
     }
 
