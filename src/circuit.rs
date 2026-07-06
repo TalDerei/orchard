@@ -1098,7 +1098,7 @@ mod tests {
 
     use ff::Field;
     use halo2_proofs::{circuit::Value, dev::MockProver};
-    use pasta_curves::pallas;
+    use pasta_curves::{pallas, vesta};
     use rand::{rngs::OsRng, RngCore};
 
     use super::{Circuit, Instance, OrchardCircuitVersion, Proof, ProvingKey, VerifyingKey, K};
@@ -1221,6 +1221,61 @@ mod tests {
         Ok((instance, proof))
     }
 
+    fn raw_instances(instances: &[Instance]) -> Vec<Vec<Vec<vesta::Scalar>>> {
+        instances
+            .iter()
+            .map(|instance| {
+                instance
+                    .to_halo2_instance()
+                    .iter()
+                    .map(|column| column.to_vec())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn raw_instance_refs(raw_instances: &[Vec<Vec<vesta::Scalar>>]) -> Vec<Vec<&[vesta::Scalar]>> {
+        raw_instances
+            .iter()
+            .map(|instance| instance.iter().map(|column| &column[..]).collect())
+            .collect()
+    }
+
+    enum ScalarEventEdit {
+        Write(vesta::Scalar),
+        Skip,
+        Stop,
+    }
+
+    fn proof_from_read_events(
+        events: &[halo2_proofs::transcript::TranscriptEvent<vesta::Affine>],
+        mut scalar_mutation: impl FnMut(usize, vesta::Scalar) -> ScalarEventEdit,
+    ) -> Vec<u8> {
+        use halo2_proofs::transcript::{Blake2bWrite, Challenge255, TranscriptWrite};
+
+        let mut transcript = Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
+        let mut scalar_idx = 0usize;
+        for event in events {
+            match event {
+                halo2_proofs::transcript::TranscriptEvent::ReadPoint(point) => {
+                    transcript.write_point(*point).unwrap();
+                }
+                halo2_proofs::transcript::TranscriptEvent::ReadScalar(scalar) => {
+                    match scalar_mutation(scalar_idx, *scalar) {
+                        ScalarEventEdit::Write(scalar) => transcript.write_scalar(scalar).unwrap(),
+                        ScalarEventEdit::Skip => {}
+                        ScalarEventEdit::Stop => break,
+                    }
+                    scalar_idx += 1;
+                }
+                halo2_proofs::transcript::TranscriptEvent::CommonPoint(_)
+                | halo2_proofs::transcript::TranscriptEvent::CommonScalar(_)
+                | halo2_proofs::transcript::TranscriptEvent::Squeeze(_) => {}
+            }
+        }
+        transcript.finalize()
+    }
+
     // TODO: recast as a proptest
     #[test]
     fn round_trip() {
@@ -1290,6 +1345,344 @@ mod tests {
         let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
         assert!(proof.verify(&vk, &instances).is_ok());
         assert_eq!(proof.0.len(), expected_proof_size);
+    }
+
+    #[test]
+    fn fingerprint_capture() {
+        use halo2_proofs::plonk::{verify_proof, FingerprintStrategy};
+        use halo2_proofs::transcript::{Challenge255, ChallengeRecorder};
+
+        let mut rng = OsRng;
+        let (circuit, instance) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+
+        let pk = ProvingKey::build();
+        let vk = VerifyingKey::build();
+
+        let circuits = [circuit];
+        let instances = [instance];
+        let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
+        // Sanity: it verifies normally.
+        assert!(proof.verify(&vk, &instances).is_ok());
+
+        // Capture the Orchard verifier fingerprint (the assembled MSM) and the Fiat-Shamir
+        // challenges — the reference an independent (Lean) model assembles and matches against.
+        let raw_instance = instances[0].to_halo2_instance();
+        let raw_instance: Vec<_> = raw_instance.iter().map(|col| &col[..]).collect();
+        let raw_instances = [&raw_instance[..]];
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof.0[..]);
+        let msm = verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instances,
+            &mut transcript,
+        )
+        .unwrap();
+
+        let (g_scalars, w_scalar, u_scalar, other) = msm.fingerprint_terms();
+        assert!(g_scalars.is_some());
+        assert!(w_scalar.is_some() && u_scalar.is_some());
+        assert!(!other.is_empty());
+        assert!(!transcript.challenges.is_empty());
+        std::eprintln!(
+            "Orchard fingerprint: {} g-scalars (n = 2^{}), w={}, u={}, {} commitment terms, {} challenges",
+            g_scalars.as_ref().unwrap().len(),
+            K,
+            w_scalar.is_some(),
+            u_scalar.is_some(),
+            other.len(),
+            transcript.challenges.len(),
+        );
+        assert!(
+            msm.eval(),
+            "captured Orchard fingerprint must be the identity for a valid proof"
+        );
+
+        // Emit the Lean fixture (proof string + challenges + VK + assembled MSM + the
+        // `MsmMatch (assemble vk ps ch) capturedMsm := by native_decide` theorem) so the
+        // independent Lean model can re-derive the fingerprint and check it matches.
+        let fixture = vk.vk.dump_lean_fixture(
+            "Zcash.Snark.Fixture",
+            K,
+            1,
+            &transcript.common_points,
+            &transcript.points,
+            &transcript.scalars,
+            &transcript.challenges,
+            &transcript.events,
+            g_scalars.as_ref().unwrap(),
+            w_scalar.unwrap(),
+            u_scalar.unwrap(),
+            &other,
+        );
+        std::fs::write(
+            "/Users/mariusmargulus/Desktop/programming/Repository/Projects/zcash/ironwood/Zcash/Snark/Fixture.lean",
+            fixture,
+        )
+        .unwrap();
+    }
+
+    /// As `fingerprint_capture`, but for a two-action bundle (`num_proofs = 2`), so the captured
+    /// fixture exercises the verifier's per-sub-proof iteration (the multi-action read schedule,
+    /// per-proof expression folds, and per-proof query wiring) that a single-action capture never
+    /// reaches. See https://github.com/zcash/ironwood/issues/17.
+    #[test]
+    fn fingerprint_capture_two_actions() {
+        use halo2_proofs::plonk::{verify_proof, FingerprintStrategy};
+        use halo2_proofs::transcript::{Challenge255, ChallengeRecorder};
+
+        let mut rng = OsRng;
+        let (circuit1, instance1) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+        let (circuit2, instance2) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+
+        let pk = ProvingKey::build();
+        let vk = VerifyingKey::build();
+
+        let circuits = [circuit1, circuit2];
+        let instances = [instance1, instance2];
+        let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
+        // Sanity: it verifies normally.
+        assert!(proof.verify(&vk, &instances).is_ok());
+
+        // Capture the two-action fingerprint and challenges, as in `fingerprint_capture`.
+        let raw_instance1 = instances[0].to_halo2_instance();
+        let raw_instance1: Vec<_> = raw_instance1.iter().map(|col| &col[..]).collect();
+        let raw_instance2 = instances[1].to_halo2_instance();
+        let raw_instance2: Vec<_> = raw_instance2.iter().map(|col| &col[..]).collect();
+        let raw_instances = [&raw_instance1[..], &raw_instance2[..]];
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof.0[..]);
+        let msm = verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instances,
+            &mut transcript,
+        )
+        .unwrap();
+
+        let (g_scalars, w_scalar, u_scalar, other) = msm.fingerprint_terms();
+        assert!(g_scalars.is_some());
+        assert!(w_scalar.is_some() && u_scalar.is_some());
+        assert!(!other.is_empty());
+        assert!(!transcript.challenges.is_empty());
+        std::eprintln!(
+            "Orchard two-action fingerprint: {} g-scalars (n = 2^{}), {} commitment terms, {} challenges",
+            g_scalars.as_ref().unwrap().len(),
+            K,
+            other.len(),
+            transcript.challenges.len(),
+        );
+        assert!(
+            msm.eval(),
+            "captured two-action Orchard fingerprint must be the identity for a valid proof"
+        );
+
+        let fixture = vk.vk.dump_lean_fixture(
+            "Zcash.Snark.Fixture2",
+            K,
+            2,
+            &transcript.common_points,
+            &transcript.points,
+            &transcript.scalars,
+            &transcript.challenges,
+            &transcript.events,
+            g_scalars.as_ref().unwrap(),
+            w_scalar.unwrap(),
+            u_scalar.unwrap(),
+            &other,
+        );
+        std::fs::write(
+            std::env::var("ORCHARD_LEAN_FIXTURE_OUT")
+                .unwrap_or_else(|_| "fixture-two-actions.lean".into()),
+            fixture,
+        )
+        .unwrap();
+    }
+
+    /// Literal Rust-side rejected/adversarial captures for the same two-action shape as
+    /// `fingerprint_capture_two_actions`. These complement Ironwood's typed Lean negative fixtures:
+    /// here the deployed verifier is driven on malformed proof byte streams while `ChallengeRecorder`
+    /// records the transcript prefix that Rust actually consumed before rejection.
+    #[test]
+    fn fingerprint_rejected_capture_two_actions() {
+        use halo2_proofs::plonk::{verify_proof, FingerprintStrategy, SingleVerifier};
+        use halo2_proofs::transcript::{Challenge255, ChallengeRecorder};
+
+        let mut rng = OsRng;
+        let (circuit1, instance1) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+        let (circuit2, instance2) =
+            generate_circuit_instance(&mut rng, OrchardCircuitVersion::FixedPostNu6_2);
+
+        let pk = ProvingKey::build();
+        let vk = VerifyingKey::build();
+
+        let circuits = [circuit1, circuit2];
+        let instances = [instance1, instance2];
+        let proof = Proof::create(&pk, &circuits, &instances, &mut rng).unwrap();
+        assert!(proof.verify(&vk, &instances).is_ok());
+
+        let raw_instances = raw_instances(&instances);
+        let raw_instance_refs = raw_instance_refs(&raw_instances);
+        let raw_instance_refs: Vec<_> = raw_instance_refs
+            .iter()
+            .map(|instance| &instance[..])
+            .collect();
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof.0[..]);
+        let valid_msm = verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instance_refs,
+            &mut transcript,
+        )
+        .unwrap();
+        assert!(valid_msm.eval());
+        assert_eq!(
+            proof_from_read_events(&transcript.events, |_, scalar| ScalarEventEdit::Write(
+                scalar
+            )),
+            proof.0,
+            "captured read events should reserialize the original proof exactly"
+        );
+
+        let n_instance_evals = instances.len();
+        let first_advice_eval = n_instance_evals;
+        let tampered_proof = proof_from_read_events(&transcript.events, |idx, scalar| {
+            ScalarEventEdit::Write(if idx == first_advice_eval {
+                scalar + vesta::Scalar::ONE
+            } else {
+                scalar
+            })
+        });
+
+        let strategy = FingerprintStrategy::new(&vk.params);
+        let mut tampered_transcript =
+            ChallengeRecorder::<_, _, Challenge255<_>>::init(&tampered_proof[..]);
+        let tampered_msm = verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instance_refs,
+            &mut tampered_transcript,
+        )
+        .unwrap();
+        assert!(
+            !tampered_msm.eval(),
+            "tampered advice-eval capture should assemble a non-identity fingerprint"
+        );
+
+        let strategy = SingleVerifier::new(&vk.params);
+        let mut tampered_reject_transcript =
+            ChallengeRecorder::<_, _, Challenge255<_>>::init(&tampered_proof[..]);
+        assert!(matches!(
+            verify_proof(
+                &vk.params,
+                &vk.vk,
+                strategy,
+                &raw_instance_refs,
+                &mut tampered_reject_transcript,
+            ),
+            Err(halo2_proofs::plonk::Error::ConstraintSystemFailure)
+        ));
+
+        // These are the Orchard action-circuit shape counts emitted by the Lean fixture dumper
+        // (`shape` in `Fixture2.lean`). Keeping them explicit avoids reaching into halo2's private
+        // verifying-key internals from this crate-local negative capture test.
+        let n_advice_queries = 25;
+        let n_fixed_evals = 29;
+        let n_permutation_common_evals = 15;
+        let n_permutation_sets = 3;
+        let n_lookups = 3;
+        let n_permutation_set_evals = instances.len() * (3 * n_permutation_sets - 1);
+        let n_lookup_evals = instances.len() * n_lookups * 5;
+        let first_multiopen_u = n_instance_evals
+            + instances.len() * n_advice_queries
+            + n_fixed_evals
+            + 1
+            + n_permutation_common_evals
+            + n_permutation_set_evals
+            + n_lookup_evals;
+        let n_multiopen_u = transcript.scalars.len() - first_multiopen_u - 2;
+        assert_eq!(n_multiopen_u, 5);
+
+        let truncated_u_proof = proof_from_read_events(&transcript.events, |idx, scalar| {
+            if idx + 1 == first_multiopen_u + n_multiopen_u {
+                ScalarEventEdit::Stop
+            } else {
+                ScalarEventEdit::Write(scalar)
+            }
+        });
+        let strategy = SingleVerifier::new(&vk.params);
+        let mut truncated_u_transcript =
+            ChallengeRecorder::<_, _, Challenge255<_>>::init(&truncated_u_proof[..]);
+        assert!(matches!(
+            verify_proof(
+                &vk.params,
+                &vk.vk,
+                strategy,
+                &raw_instance_refs,
+                &mut truncated_u_transcript,
+            ),
+            Err(halo2_proofs::plonk::Error::Opening)
+        ));
+        assert!(
+            truncated_u_transcript.challenges.len() >= 8,
+            "malformed-u capture should reach the multiopen x3 challenge before rejection"
+        );
+
+        let first_permutation_set_eval = n_instance_evals
+            + instances.len() * n_advice_queries
+            + n_fixed_evals
+            + 1
+            + n_permutation_common_evals;
+        let first_nonlast_permutation_last_eval = first_permutation_set_eval + 2;
+        let missing_permutation_last_eval_proof =
+            proof_from_read_events(&transcript.events, |idx, scalar| {
+                if idx == first_nonlast_permutation_last_eval {
+                    ScalarEventEdit::Skip
+                } else {
+                    ScalarEventEdit::Write(scalar)
+                }
+            });
+        let strategy = SingleVerifier::new(&vk.params);
+        let mut missing_permutation_last_eval_transcript =
+            ChallengeRecorder::<_, _, Challenge255<_>>::init(
+                &missing_permutation_last_eval_proof[..],
+            );
+        assert!(verify_proof(
+            &vk.params,
+            &vk.vk,
+            strategy,
+            &raw_instance_refs,
+            &mut missing_permutation_last_eval_transcript,
+        )
+        .is_err());
+
+        std::eprintln!(
+            "Orchard negative captures: tampered advice eval events={} challenges={} scalars={} points={}; truncated-u events={} challenges={} scalars={} points={}; missing permutation last-eval events={} challenges={} scalars={} points={}",
+            tampered_reject_transcript.events.len(),
+            tampered_reject_transcript.challenges.len(),
+            tampered_reject_transcript.scalars.len(),
+            tampered_reject_transcript.points.len(),
+            truncated_u_transcript.events.len(),
+            truncated_u_transcript.challenges.len(),
+            truncated_u_transcript.scalars.len(),
+            truncated_u_transcript.points.len(),
+            missing_permutation_last_eval_transcript.events.len(),
+            missing_permutation_last_eval_transcript.challenges.len(),
+            missing_permutation_last_eval_transcript.scalars.len(),
+            missing_permutation_last_eval_transcript.points.len(),
+        );
     }
 
     // Proves with the proving key for `proving_version` and checks that the proof verifies
