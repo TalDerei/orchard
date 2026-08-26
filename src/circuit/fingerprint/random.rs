@@ -239,13 +239,16 @@ pub(super) fn capture_random_fixture(
         proof_bytes.len(),
     );
 
-    let fixture = vk.vk.dump_vesta_lean_fixture_match_only(
+    // The fabricated proof bytes — exactly what the replay consumed — go to the exporter, which
+    // checks that the replay's reads re-serialize to them and carries them as `capturedProofHex`.
+    let fixture = vk.vk.dump_vesta_lean_fixture_match_only_with_proof_bytes(
         namespace,
         "PostNu6_3",
         K,
         &raw_instance_refs,
         &replay,
         &msm,
+        &proof_bytes,
     );
     if let Some(path) = std::env::var_os(fixture_output_var) {
         std::fs::write(std::path::PathBuf::from(path), fixture).unwrap();
