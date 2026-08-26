@@ -9,7 +9,7 @@ and this project adheres to Rust's notion of
 
 ### Changed
 - The `verifier-fingerprint` capture drivers now hand the proof byte string the
-  verifier consumed to halo2's `dump_vesta_lean_fixture_with_proof_bytes` /
+  verifier consumed to halo2's `dump_vesta_lean_fixture_honest_with_proof_bytes` /
   `dump_vesta_lean_fixture_match_only_with_proof_bytes`, so every exported
   fixture carries it hex-encoded as `capturedProofHex` after the exporter's
   re-serialization check. Requires a `halo2_proofs` release providing those
