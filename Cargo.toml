@@ -115,4 +115,4 @@ debug = true
 
 # Temporary until a halo2_proofs release includes zcash/halo2#933.
 [patch.crates-io]
-halo2_proofs = { git = "https://github.com/TalDerei/halo2.git", rev = "d9a8c7374192d299d11366ed159bc1b3d1a38902" }
+halo2_proofs = { git = "https://github.com/TalDerei/halo2.git", rev = "74a5c1fab777a59ab16bcce8cf42714212a6ecac" }
